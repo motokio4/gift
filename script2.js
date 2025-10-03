@@ -1,6 +1,7 @@
-console.log('🎵 Плеер + Мини-игра (клик/тап, дистанции 250–350, финал фуллскрин, drag прогресса)');
+console.log('🎵 Плеер + Мини-игра (мобайл-адаптив, WebAudio громкость, ретина, финал фуллскрин)');
 
 /* ================= ПЛЕЕР ================= */
+// Полностью обновлённый класс: громкость через Web Audio (работает на iOS/Android)
 class MusicPlayer {
   constructor() {
     this.audio = document.getElementById('music');
@@ -15,6 +16,14 @@ class MusicPlayer {
     this.playerCard = document.getElementById('playerCard');
     this.volumeSlider = document.getElementById('volumeSlider');
     this.volumeToggle = document.getElementById('volumeToggle');
+
+    // Web Audio (для мобилок/iOS)
+    this.AudioCtx = window.AudioContext || window.webkitAudioContext || null;
+    this.ctx = null;
+    this.sourceNode = null;
+    this.gainNode = null;
+    this.usesWebAudio = !!this.AudioCtx;
+    this.audioGraphReady = false;
 
     // drag state
     this.isScrubbing = false;
@@ -73,23 +82,42 @@ class MusicPlayer {
     this.isPlaying = false;
     this.typewriterInterval = null;
     this.isMuted = false;
-    this.previousVolume = 50;
+    this.previousVolume = 50; // 0..100
 
     this.init();
   }
 
   init(){
     setTimeout(()=>this.playerCard.classList.add('visible'),300);
-    this.playPauseBtn.addEventListener('click',()=>this.togglePlayPause());
+
+    // Требуется первый пользовательский жест для инициализации WebAudio на iOS
+    const userGestureInit = () => {
+      this.ensureAudioGraph();
+      document.removeEventListener('pointerdown', userGestureInit);
+      document.removeEventListener('keydown', userGestureInit);
+    };
+    document.addEventListener('pointerdown', userGestureInit, { once: true });
+    document.addEventListener('keydown', userGestureInit, { once: true });
+
+    this.playPauseBtn.addEventListener('click',()=>{ this.togglePlayPause(); });
     this.restartBtn.addEventListener('click',()=>this.restartMusic());
-    this.volumeSlider.addEventListener('input',e=>this.setVolume(+e.target.value));
-    this.volumeToggle.addEventListener('click',()=>this.toggleMute());
-    // доступность: mute по Enter/Space
+    this.volumeSlider.addEventListener('input',e=>{
+      this.ensureAudioGraph();
+      this.setVolume(+e.target.value);
+    });
+    this.volumeToggle.addEventListener('click',()=>{
+      this.ensureAudioGraph();
+      this.toggleMute();
+    });
     this.volumeToggle.addEventListener('keydown',(e)=>{
-      if(e.key==='Enter'||e.key===' '){ e.preventDefault(); this.toggleMute(); }
+      if(e.key==='Enter'||e.key===' '){
+        e.preventDefault();
+        this.ensureAudioGraph();
+        this.toggleMute();
+      }
     });
 
-    // клик по прогрессу
+    // клик/скраб по прогрессу
     this.progressContainer.addEventListener('click',e=>{
       if (this.isScrubbing) return;
       const r=this.progressContainer.getBoundingClientRect();
@@ -97,8 +125,6 @@ class MusicPlayer {
       if (this.audio.duration && isFinite(this.audio.duration))
         this.audio.currentTime=Math.max(0,Math.min(1,ratio))*this.audio.duration;
     });
-
-    // перетаскивание прогресса (mouse/touch unified)
     this.progressContainer.addEventListener('pointerdown', e => this.startScrub(e));
     document.addEventListener('pointermove', e => this.onScrub(e), {passive:false});
     document.addEventListener('pointerup',   () => this.endScrub());
@@ -115,6 +141,37 @@ class MusicPlayer {
 
     this.setVolume(50);
     this.showInitialText();
+  }
+
+  // Создаём аудио-граф один раз (MediaElementSource -> Gain -> destination)
+  ensureAudioGraph(){
+    if (!this.usesWebAudio || this.audioGraphReady) return;
+
+    try {
+      this.ctx = this.ctx || new this.AudioCtx();
+      if (this.ctx.state === 'suspended') this.ctx.resume();
+
+      if (!this.sourceNode) {
+        this.sourceNode = this.ctx.createMediaElementSource(this.audio);
+      }
+      if (!this.gainNode) {
+        this.gainNode = this.ctx.createGain();
+        this.gainNode.gain.value = (this.previousVolume / 100);
+      }
+
+      this.sourceNode.connect(this.gainNode);
+      this.gainNode.connect(this.ctx.destination);
+
+      // На iOS регулировка через <audio>.volume игнорируется — используем gain
+      this.audio.volume = 1;
+      this.audio.muted = false;
+
+      this.audioGraphReady = true;
+    } catch(e){
+      // Фоллбек на обычный audio.volume
+      this.usesWebAudio = false;
+      console.warn('WebAudio недоступен, используем audio.volume', e);
+    }
   }
 
   /* drag helpers */
@@ -136,7 +193,6 @@ class MusicPlayer {
     this.progressFill.style.width = `${ratio*100}%`;
     this.currentTimeEl.textContent = this.formatTime(t);
     this.audio.currentTime = t;
-    // сразу подтянуть лирику при скрабе
     this.updateLyrics();
   }
   endScrub(){
@@ -151,12 +207,61 @@ class MusicPlayer {
   }
   togglePlayPause(){ this.isPlaying?this.pauseMusic():this.playMusic(); this.updateButtonClasses(); }
   updateButtonClasses(){ this.playPauseBtn.classList.toggle('play',!this.isPlaying); this.playPauseBtn.classList.toggle('pause',this.isPlaying); }
-  async playMusic(){ try{ await this.audio.play(); this.isPlaying=true; this.updateLyrics(); }catch{} }
+  async playMusic(){
+    try{
+      this.ensureAudioGraph();
+      if (this.ctx && this.ctx.state === 'suspended') await this.ctx.resume();
+      await this.audio.play();
+      this.isPlaying=true;
+      this.updateLyrics();
+    }catch{}
+  }
   pauseMusic(){ this.audio.pause(); this.isPlaying=false; if (this.typewriterInterval) clearInterval(this.typewriterInterval); }
   restartMusic(){ this.audio.currentTime=0; this.currentLyricIndex=-1; this.showInitialText(); this.playMusic(); }
-  setVolume(v){ const vol=Math.max(0,Math.min(100,Number(v)||0)); this.audio.volume=vol/100; this.volumeSlider.value=String(vol); this.updateVolumeIcon(this.audio.volume); if(this.isMuted && vol>0) this.isMuted=false; if(vol>0) this.previousVolume=vol; }
-  toggleMute(){ if(this.isMuted||this.audio.volume===0){ const restore=this.previousVolume||50; this.setVolume(restore); this.isMuted=false; } else { this.previousVolume=this.volumeSlider.valueAsNumber||50; this.setVolume(0); this.isMuted=true; } }
-  updateVolumeIcon(vol){ this.volumeToggle.className='volume-icon'; if(vol===0||this.isMuted) this.volumeToggle.classList.add('muted'); else if(vol<0.5) this.volumeToggle.classList.add('low'); else this.volumeToggle.classList.add('high'); }
+
+  setVolume(v){
+    const vol = Math.max(0, Math.min(100, Number(v)||0));
+    this.volumeSlider.value = String(vol);
+    this.previousVolume = vol;
+
+    if (this.audioGraphReady && this.gainNode) {
+      this.gainNode.gain.value = vol/100;
+    } else {
+      this.audio.volume = vol/100;
+    }
+    if (vol > 0) this.isMuted = false;
+    this.updateVolumeIcon(this.getEffectiveVolume());
+  }
+
+  toggleMute(){
+    this.ensureAudioGraph();
+    if (this.isMuted || this.getEffectiveVolume() === 0){
+      const restore = this.previousVolume || 50;
+      this.setVolume(restore);
+      this.isMuted = false;
+    } else {
+      if (this.audioGraphReady && this.gainNode) {
+        this.gainNode.gain.value = 0;
+      } else {
+        this.audio.volume = 0;
+      }
+      this.isMuted = true;
+      this.updateVolumeIcon(0);
+    }
+  }
+
+  getEffectiveVolume(){
+    if (this.audioGraphReady && this.gainNode) return this.gainNode.gain.value;
+    return this.audio.volume;
+  }
+
+  updateVolumeIcon(vol){
+    this.volumeToggle.className='volume-icon';
+    if(vol===0||this.isMuted) this.volumeToggle.classList.add('muted');
+    else if(vol<0.5) this.volumeToggle.classList.add('low');
+    else this.volumeToggle.classList.add('high');
+  }
+
   updateProgress(){
     const ct=this.audio.currentTime, dur=this.audio.duration||0;
     this.progressFill.style.width=`${dur? (ct/dur*100):0}%`;
@@ -181,7 +286,7 @@ class MusicPlayer {
   formatTime(s){ if(!s||isNaN(s)||!isFinite(s)) return '0:00'; const m=Math.floor(s/60), ss=Math.floor(s%60); return `${m}:${ss<10?'0':''}${ss}`; }
 }
 
-/* ============== Мини-игра (бывш. Level1) ============== */
+/* ============== Мини-игра (мобайл-адаптив + ретина) ============== */
 class GameRunner {
   constructor(){
     this.canvas = document.getElementById('gameCanvas');
@@ -191,18 +296,22 @@ class GameRunner {
     this.btnReset = document.getElementById('gameReset');
     this.finalScene = document.getElementById('finalScene');
 
-    // Параметры
+    // ЛОГИЧЕСКИЕ размеры мира (не зависят от пикселей экрана)
+    this.W = 900;
+    this.H = 260;
+
+    // Параметры физики
     this.gravity = 1600;
     this.jumpVel = -520;
     this.speed = 240;
-    this.groundY = this.canvas.height - 40;
+    this.groundY = this.H - 40;
 
     // Игрок
     this.player = { x: 84, y: this.groundY-42, w: 46, h: 42, vy:0, onGround:true, alive:true };
 
-    // Спрайт девушки (опционально)
+    // Спрайт
     this.girlImg = new Image();
-    this.girlImg.src = 'girl.png'; // положи рядом с index.html
+    this.girlImg.src = 'girl.png';
     this.girlLoaded = false;
     this.girlImg.onload = () => this.girlLoaded = true;
 
@@ -223,14 +332,14 @@ class GameRunner {
     this.btnReset.addEventListener('click', ()=> this.reset());
     this.canvas.addEventListener('pointerdown', ()=>{ if(this.running) this.jump(); });
 
-    // закрытие финальной сцены по клику и ESC
+    // Закрытие финальной сцены по клику и ESC
     this.finalScene.addEventListener('click', (e)=>{
       const isCloseBtn = e.target.closest('.final-close');
       const isOutside  = e.target === this.finalScene;
       if (isCloseBtn || isOutside) this.closeFinal();
     });
 
-    // доступность: пробел/стрелка вверх — прыжок; Esc — закрыть оверлей
+    // Доступность: пробел/стрелка вверх — прыжок; Esc — закрыть оверлей
     window.addEventListener('keydown', (e)=>{
       if (e.key === 'Escape' && this.finalScene.classList.contains('show')) {
         this.closeFinal();
@@ -252,8 +361,7 @@ class GameRunner {
       const w = 16 + Math.floor(Math.random()*8);   // 16–24
       const h = 16 + Math.floor(Math.random()*8);   // 16–24
       this.obstacles.push({ x, y:this.groundY-h, w, h, counted:false });
-      // расстояние между препятствиями: 250–350
-      x += 250 + Math.floor(Math.random()*100);
+      x += 250 + Math.floor(Math.random()*100);     // расстояние: 250–350
     }
     this.finishX = x + 120;
     this.passed = 0;
@@ -264,22 +372,47 @@ class GameRunner {
     if (this.running) return; // защита от повторных запусков
     this.running = true;
     this.hideMsg();
+
+    // Важно: при старте делаем корректный ресайз
     this.resizeCanvasToDisplaySize();
+
     this.lastT = performance.now();
     requestAnimationFrame((t)=>this.loop(t));
   }
 
-  // ретина-скейл: рисуем в CSS-координатах, но с чётким bitmap
+  // Ретина + адаптивная высота под ширину контейнера
   resizeCanvasToDisplaySize(){
-    const ratio = Math.max(1, Math.floor(window.devicePixelRatio || 1));
-    const rect  = this.canvas.getBoundingClientRect();
-    const needW = Math.floor(rect.width  * ratio);
-    const needH = Math.floor(rect.height * ratio);
+    const ratioDPR = Math.max(1, Math.floor(window.devicePixelRatio || 1));
+
+    // Текущая CSS-ширина
+    const rect = this.canvas.getBoundingClientRect();
+    const cssW = Math.max(1, Math.floor(rect.width));
+
+    // Сохраняем исходные пропорции 900:260
+    let cssH = Math.floor(cssW * (this.H / this.W));
+
+    // На узких экранах — ограничим высоту, чтобы точно влезало
+    if (window.innerWidth <= 560) {
+      cssH = Math.max(140, Math.min(220, cssH));
+    }
+
+    // Проставим CSS-высоту (визуальная высота элемента)
+    this.canvas.style.height = cssH + 'px';
+
+    // Размер bitmap под DPR
+    const needW = cssW * ratioDPR;
+    const needH = cssH * ratioDPR;
     if (this.canvas.width !== needW || this.canvas.height !== needH) {
       this.canvas.width  = needW;
       this.canvas.height = needH;
     }
-    this.ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+
+    // Масштаб логической системы координат (900x260) к текущему cssW x cssH
+    const scaleX = (cssW * ratioDPR) / this.W;
+    const scaleY = (cssH * ratioDPR) / this.H;
+    const scale  = Math.min(scaleX, scaleY);
+
+    this.ctx.setTransform(scale, 0, 0, scale, 0, 0);
   }
 
   jump(){
@@ -325,28 +458,37 @@ class GameRunner {
   draw(){
     const c = this.ctx;
 
-    // очистка bitmap целиком
+    // Полная очистка bitmap
     c.setTransform(1,0,0,1,0,0);
     c.clearRect(0,0,this.canvas.width,this.canvas.height);
 
-    // восстановить рисование в CSS-координатах
-    const ratio = Math.max(1, Math.floor(window.devicePixelRatio || 1));
-    c.setTransform(ratio,0,0,ratio,0,0);
+    // Вернуть трансформацию под текущий размер (как в resize)
+    const ratioDPR = Math.max(1, Math.floor(window.devicePixelRatio || 1));
+    const rect     = this.canvas.getBoundingClientRect();
+    const cssW     = Math.max(1, Math.floor(rect.width));
+    const cssH     = Math.max(1, Math.floor(rect.height));
+    const scaleX   = (cssW * ratioDPR) / this.W;
+    const scaleY   = (cssH * ratioDPR) / this.H;
+    const scale    = Math.min(scaleX, scaleY);
+    c.setTransform(scale,0,0,scale,0,0);
 
-    const W = this.canvas.width / ratio;
-    const H = this.canvas.height / ratio;
+    const W = this.W, H = this.H;
 
+    // Фон, "сканлайны"
     c.fillStyle='#0a0a0a'; c.fillRect(0,0,W,H);
     c.fillStyle='#0c0c0c'; for(let i=0;i<H;i+=6){ c.fillRect(0,i,W,1); }
 
+    // Земля
     c.fillStyle='#151515'; c.fillRect(0,this.groundY+1,W,2);
     c.fillStyle='#1d1d1d'; c.fillRect(0,this.groundY+3,W,3);
 
+    // Препятствия
     for(const o of this.obstacles){
       c.fillStyle='#3b0b0b'; c.fillRect(o.x,o.y,o.w,o.h);
       c.fillStyle='#5a1010'; c.fillRect(o.x+1,o.y+1,o.w-2,o.h-2);
     }
 
+    // Финиш
     if(this.passed >= this.totalToFinish){
       const flagW=8;
       for(let y=0;y<this.groundY; y+=10){
@@ -358,8 +500,10 @@ class GameRunner {
       c.fillText('ТАНАИС', this.finishX-36, this.groundY-52);
     }
 
+    // Игрок
     this.drawGirlImage(c, this.player);
 
+    // HUD
     c.fillStyle='rgba(170,0,0,.85)'; c.font='16px Times New Roman';
     c.fillText(`Осталось: ${Math.max(0, this.totalToFinish - this.passed)}`, 14, 22);
   }
@@ -387,7 +531,6 @@ class GameRunner {
       this.hideMsg();
       this.finalScene.classList.add('show'); // плавное проявление
       document.body.classList.add('modal-open');
-      // фокус на кнопку закрытия
       const closeBtn = this.finalScene.querySelector('.final-close');
       closeBtn?.focus();
     }, 900);
@@ -402,7 +545,7 @@ class GameRunner {
   hideMsg(){ this.msg.classList.remove('show'); }
 }
 
-// ЕДИНСТВЕННЫЙ запуск (убран дубль MusicPlayer)
+// ЕДИНСТВЕННЫЙ запуск
 window.addEventListener('load', ()=>{
   window.musicPlayer = new MusicPlayer();
   window.gameRunner  = new GameRunner();
